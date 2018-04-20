@@ -6,6 +6,8 @@ import akka.stream.scaladsl.{ Keep, Sink, Source }
 import java.util.UUID
 import mesosphere.marathon.poc.repository.StateTransition
 import mesosphere.marathon.poc.state.{ Instance, RunSpec, RunSpecRef }
+import mesosphere.marathon.test.SettableClock
+import org.apache.mesos.v1.mesos.{ AgentID, TaskID, TaskState, TaskStatus }
 import org.scalatest.Inside
 import mesosphere.marathon.poc.repository.StateAuthority
 
@@ -33,7 +35,40 @@ class SchedulerLogicTest extends AkkaUnitTestLike with Inside {
           sampleInstance.instanceId,
           Some(sampleInstance)))))
 
-    result.pull().futureValue shouldBe SchedulerLogic.Effect.WantOffers(instanceId)
+    result.pull().futureValue shouldBe Some(SchedulerLogic.Effect.WantOffers(instanceId))
     result
+  }
+
+  "it kills unknown running tasks and expunges the task" in {
+    val clock = new SettableClock
+    val (input, result) = Source.queue[SchedulerLogicInputEvent](16, OverflowStrategy.fail)
+      .via(SchedulerLogic.eventProcesorFlow(clock))
+      .toMat(Sink.queue())(Keep.both)
+      .run
+
+    val mesosTaskId = MesosTaskId("lol", MesosTaskId.emptyUUID, 1L)
+    val agentId = "lolol"
+    val status = TaskStatus(
+      TaskID(mesosTaskId.asString),
+      TaskState.TASK_RUNNING,
+      timestamp = Some(0.0),
+      agentId = Some(AgentID(agentId)))
+    val Some(task) = MesosTask.apply(status)
+
+    input.offer(SchedulerLogicInputEvent.MesosTaskStatus(task))
+
+    inside(result.pull().futureValue) {
+      case Some(SchedulerLogic.Effect.TaskUpdate(taskId, newState)) =>
+        taskId shouldBe mesosTaskId
+    }
+    inside(result.pull().futureValue) {
+      case Some(SchedulerLogic.Effect.KillTask(taskId, Some(agentId))) =>
+        taskId shouldBe mesosTaskId
+        agentId shouldBe agentId
+    }
+
+    inside(result.pull().futureValue) {
+      case Some(SchedulerLogic.Effect.TaskUpdate(taskId, None)) =>
+    }
   }
 }

@@ -13,21 +13,39 @@ import monocle.macros.syntax.lens._
 import monocle.function.At.at
 import scala.annotation.tailrec
 
-case class MesosTask(
-    taskId: String,
-    agentId: String,
-    phase: MesosTask.Phase) {
+case class MesosTaskId(
+    appName: String,
+    instanceId: UUID,
+    incarnation: Long) {
+  def asString: String = s"${appName}#${instanceId}#${incarnation}"
+}
 
-  val (name, instanceId, incarnation) = Instance.parseMesosTaskId(taskId) match {
-    case Some(tpl) => tpl
+object MesosTaskId {
+  private[scheduler] val emptyUUID = UUID.fromString("00000000-0000-0000-0000-000000000000")
+
+  private def parseMesosTaskId(mesosTaskId: String): Option[(String, UUID, Long)] =
+    mesosTaskId.split("#") match {
+      case Array(name, uuid, incarnation) =>
+        Some((name, UUID.fromString(uuid), java.lang.Long.parseLong(incarnation)))
+      case _ =>
+        None
+    }
+
+  def apply(taskId: String): MesosTaskId = parseMesosTaskId(taskId) match {
+    case Some((appName, instanceId, incarnation)) => MesosTaskId(appName, instanceId, incarnation)
     case None =>
       // shouldn't really get here
-      ("???", MesosTask.emptyUUID, 0L)
+      MesosTaskId("???", emptyUUID, 0L)
   }
 }
 
+case class MesosTask(
+    taskId: MesosTaskId,
+    agentId: String,
+    phase: MesosTask.Phase) {
+}
+
 object MesosTask {
-  private[MesosTask] val emptyUUID = UUID.fromString("00000000-0000-0000-0000-000000000000")
 
   def considerRunning(phase: Phase) = phase match {
     case _: Phase.Launching | _: Phase.Running => true
@@ -41,7 +59,7 @@ object MesosTask {
   def apply(mesosTask: TaskStatus): Option[MesosTask] =
     mesosTask.agentId.value map { agentId =>
       MesosTask(
-        mesosTask.taskId.value,
+        MesosTaskId(mesosTask.taskId.value),
         agentId.value,
         Phase(mesosTask))
     }
@@ -90,7 +108,7 @@ case class MesosAgent(
 
 case class MesosState(
     agents: Map[String, MesosAgent],
-    tasks: Map[String, MesosTask])
+    tasks: Map[MesosTaskId, MesosTask])
 
 object MesosState {
   def empty = MesosState(Map.empty, Map.empty)
@@ -126,19 +144,20 @@ object SchedulerLogic {
     /**
       * Indicate to Mesos that a task should be killed
       */
-    case class KillTask(taskId: String, agent: Option[String]) extends MesosEffect
+    case class KillTask(taskId: MesosTaskId, agent: Option[String]) extends MesosEffect
 
     /**
       * Indicate that the task is to be forgotten.
       */
-    case class TaskUpdate(taskId: String, newState: Option[MesosTask]) extends Effect
+    case class TaskUpdate(taskId: MesosTaskId, newState: Option[MesosTask]) extends Effect
+    // Maybe move this to the default orchestator?
     case class BumpIncarnation(instanceId: UUID, incarnation: Long) extends Effect
 
     case class EmitState(requestId: UUID, frame: SchedulerFrame) extends Effect
   }
 
   def computeEffect(marathonInstance: Option[Instance], mesosTask: Option[MesosTask])(clock: Clock): Seq[Effect] = {
-    def killExpunge(taskId: String, agentId: Option[String]): List[Effect] =
+    def killExpunge(taskId: MesosTaskId, agentId: Option[String]): List[Effect] =
       List(
         Effect.KillTask(taskId, agentId),
         Effect.TaskUpdate(taskId, None))
@@ -163,11 +182,11 @@ object SchedulerLogic {
     (marathonInstance, mesosTask) match {
       case (Some(instance), None) =>
         Seq(Effect.WantOffers(instance.instanceId))
-      case (Some(instance), Some(task)) if task.incarnation < instance.incarnation =>
+      case (Some(instance), Some(task)) if task.taskId.incarnation < instance.incarnation =>
         kill(task)
       case (None, Some(task)) =>
-        kill(task)
-      case (Some(instance), Some(task)) if task.incarnation == instance.incarnation =>
+        killExpunge(task.taskId, Some(task.agentId))
+      case (Some(instance), Some(task)) if task.taskId.incarnation == instance.incarnation =>
         (instance.goal, MesosTask.considerRunning(task.phase)) match {
           case (Instance.Goal.Running, true) =>
             Nil
@@ -178,21 +197,38 @@ object SchedulerLogic {
           case (Instance.Goal.Stopped, false) =>
             Nil
         }
-      case (Some(instance), Some(task)) if task.incarnation > instance.incarnation =>
+      case (None, None) =>
+        throw new RuntimeException("we should not get here")
+      case (Some(instance), Some(task)) if task.taskId.incarnation > instance.incarnation =>
         /* We should never get here. */
 
         if (MesosTask.considerRunning(task.phase))
-          Effect.BumpIncarnation(instance.instanceId, task.incarnation + 1) ::
+          Effect.BumpIncarnation(instance.instanceId, task.taskId.incarnation + 1) ::
             killExpunge(task.taskId, Some(task.agentId))
         else
           Nil
     }
   }
 
-  def computeEffects(marathonState: MarathonState, mesosState: MesosState, affectedInstances: Seq[UUID])(clock: Clock): List[Effect] =
-    affectedInstances.distinct.flatMap { instanceId =>
-      computeEffect(marathonState.instances.instances.get(instanceId), mesosState.tasks.get(instanceId.toString))(clock)
-    }(collection.breakOut)
+  /**
+    * Returns the effects currently necessary to advance towards the goal
+    */
+  def computeEffects(marathonState: MarathonState, mesosState: MesosState, affectedInstances: Seq[UUID], affectedTasks: Seq[MesosTaskId])(clock: Clock): (List[Effect], MesosState) = {
+    val instanceEffects = affectedInstances.distinct.iterator.
+      flatMap(marathonState.instances.instances.get).
+      flatMap { instance =>
+        computeEffect(Some(instance), mesosState.tasks.get(instance.mesosTaskId))(clock)
+      }
+    val taskEffects = affectedTasks.distinct.iterator.
+      flatMap(mesosState.tasks.get).
+      flatMap { task =>
+        computeEffect(marathonState.instances.instances.get(task.taskId.instanceId), Some(task))(clock)
+      }
+
+    val effects = (instanceEffects ++ taskEffects).toList
+
+    (effects, applyTaskUpdates(mesosState, effects.collect { case u: Effect.TaskUpdate => u }))
+  }
 
   def applyTaskUpdates(mesosState: MesosState, effects: Seq[Effect.TaskUpdate]): MesosState = {
     mesosState.lens(_.tasks).modify { tasks =>
@@ -201,22 +237,6 @@ object SchedulerLogic {
           tasks - taskId
         case (tasks, Effect.TaskUpdate(taskId, Some(task))) =>
           tasks.updated(taskId, task)
-      }
-    }
-  }
-
-  def affectedInstanceIdsForTaskUpdates(tasks: Seq[Effect.TaskUpdate]): Seq[UUID] = {
-    tasks.flatMap { t =>
-      t.newState match {
-        case Some(t) => Some(t.instanceId)
-        case None =>
-          Instance.parseMesosTaskId(t.taskId) match {
-            case Some((name, instanceId, incarnation)) =>
-              Some(instanceId)
-            case None =>
-              None
-          }
-
       }
     }
   }
@@ -238,11 +258,11 @@ object SchedulerLogic {
 
             val mesosStateWithTaskUpdates = applyTaskUpdates(frame.mesosState, taskUpdates)
 
-            val effects = computeEffects(
-              frame.state, mesosStateWithTaskUpdates, affectedInstanceIdsForTaskUpdates(taskUpdates))(clock)
+            val (effects, finalMesosState) = computeEffects(
+              frame.state, mesosStateWithTaskUpdates, Nil, taskUpdates.map(_.taskId))(clock)
 
             frame = frame.copy(
-              mesosState = applyTaskUpdates(frame.mesosState, effects.collect { case u: Effect.TaskUpdate => u }))
+              mesosState = finalMesosState)
 
             taskUpdates ++ effects
 
@@ -255,11 +275,9 @@ object SchedulerLogic {
 
           case SchedulerLogicInputEvent.MarathonStateUpdate(updates) =>
             val nextMarathonState = StateTransition.applyTransitions(frame.state, updates)
-            val effects = computeEffects(nextMarathonState, frame.mesosState, StateTransition.affectedInstanceIds(updates))(clock)
+            val (effects, finalMesosState) = computeEffects(nextMarathonState, frame.mesosState, StateTransition.affectedInstanceIds(updates), Nil)(clock)
 
-            frame = frame.copy(
-              state = nextMarathonState,
-              mesosState = applyTaskUpdates(frame.mesosState, effects.collect { case u: Effect.TaskUpdate => u }))
+            frame = frame.copy(state = nextMarathonState, mesosState = finalMesosState)
 
             effects
         }

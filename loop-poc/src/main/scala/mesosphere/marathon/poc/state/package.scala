@@ -2,6 +2,7 @@ package mesosphere.marathon
 package poc
 
 import java.util.UUID
+import mesosphere.marathon.poc.scheduler.MesosTaskId
 
 package state {
   /**
@@ -26,7 +27,9 @@ package state {
       runSpec: RunSpecRef,
       incarnation: Long,
       goal: Instance.Goal
-  )
+  ) {
+    lazy val mesosTaskId = MesosTaskId(runSpec.id, instanceId, incarnation)
+  }
 
   object Instance {
     sealed trait Goal
@@ -35,16 +38,8 @@ package state {
       case object Stopped extends Goal
     }
 
-    def mesosIdFor(instance: Instance): String =
-      s"${instance.runSpec.id}#${instance.instanceId}#${instance.incarnation}"
-
-    def parseMesosTaskId(mesosTaskId: String): Option[(String, UUID, Long)] =
-      mesosTaskId.split("#") match {
-        case Array(name, uuid, incarnation) =>
-          Some((name, UUID.fromString(uuid), java.lang.Long.parseLong(incarnation)))
-        case _ =>
-          None
-      }
+    def mesosIdFor(instance: Instance): MesosTaskId =
+      MesosTaskId(instance.runSpec.id, instance.instanceId, instance.incarnation)
   }
 
   case class DeploymentPolicy(

@@ -27,7 +27,7 @@ object MesosAdapter extends StrictLogging {
   def eventResponder(calls: MesosCalls) = Flow[SchedulerLogic.MesosEffect].mapConcat {
     case SchedulerLogic.Effect.KillTask(taskId, agent) =>
       Seq(
-        calls.newKill(TaskID(taskId), agent.map(AgentID(_)), killPolicy = None))
+        calls.newKill(TaskID(taskId.asString), agent.map(AgentID(_)), killPolicy = None))
     case _: SchedulerLogic.Effect.WantOffers =>
       // handled by offerReviver
       Nil
