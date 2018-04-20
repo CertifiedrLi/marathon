@@ -7,8 +7,8 @@ import java.time.{ Clock, Instant }
 import java.util.UUID
 import mesosphere.marathon.poc.repository.{ StateFrame, StateTransition }
 import mesosphere.marathon.poc.repository.MarathonState
-import mesosphere.marathon.poc.state.Instance
-import org.apache.mesos.v1.mesos.{ Offer, TaskState, TaskStatus }
+import mesosphere.marathon.poc.state.{ Instance, RunSpec }
+import org.apache.mesos.v1.mesos.{ Offer, OfferID, Resource, TaskState, TaskStatus, Value }
 import monocle.macros.syntax.lens._
 import monocle.function.At.at
 import scala.annotation.tailrec
@@ -154,6 +154,12 @@ object SchedulerLogic {
     case class BumpIncarnation(instanceId: UUID, incarnation: Long) extends Effect
 
     case class EmitState(requestId: UUID, frame: SchedulerFrame) extends Effect
+
+    case class OfferResponse(
+        offerId: OfferID,
+        remainingOffer: Offer,
+        operations: Seq[Offer.Operation]
+    ) extends MesosEffect
   }
 
   def computeEffect(marathonInstance: Option[Instance], mesosTask: Option[MesosTask])(clock: Clock): Seq[Effect] = {
@@ -238,6 +244,78 @@ object SchedulerLogic {
         case (tasks, Effect.TaskUpdate(taskId, Some(task))) =>
           tasks.updated(taskId, task)
       }
+    }
+  }
+
+  case class RejectReason(str: String)
+
+  /**
+    * Silly match function
+    *
+    * Return:
+    *   Right((remainingOffer, matchedResources)) | Left(rejectReason)
+    */
+  def matchOffers(offer: Offer, runSpec: RunSpec): Either[RejectReason, (Offer, Seq[Resource])] = {
+    def consumeScalar(resource: Resource, amount: Double): (Resource, Resource) = {
+      val remaining = resource.lens(_.scalar).modify {
+        case Some(scalar) => Some(Value.Scalar(scalar.value - amount))
+        case None => None // shouldn't get here
+      }
+      val consumed = resource.lens(_.scalar).modify {
+        case Some(scalar) => Some(Value.Scalar(amount))
+        case None => None // shouldn't get here
+      }
+
+      (remaining, consumed)
+    }
+
+    type Matcher = PartialFunction[Resource, (Resource, Resource)]
+
+    val cpusMatcher: Matcher = {
+      case cpus if cpus.name == "cpus" && cpus.scalar.forall(_.value >= runSpec.cpus) =>
+        consumeScalar(cpus, runSpec.cpus)
+    }
+    val memMatcher: Matcher = {
+      case mem if mem.name == "cpus" && mem.scalar.forall(_.value >= runSpec.mem) =>
+        consumeScalar(mem, runSpec.mem)
+    }
+
+    @tailrec def runMatches(matchers: List[Matcher], resources: List[Resource], matched: List[Resource]): Either[RejectReason, (List[Resource], List[Resource])] = {
+      matchers match {
+        case Nil =>
+          Right((resources, matched))
+        case m :: restMatchers =>
+          val matchIndex = resources.indexWhere { r => m.isDefinedAt(r) }
+          if (matchIndex == -1)
+            Left(RejectReason("Not all resources were satisfied"))
+          else {
+            val (remaining, thisMatch) = m(resources(matchIndex))
+            runMatches(
+              restMatchers,
+              resources.updated(matchIndex, remaining),
+              thisMatch :: matched)
+          }
+      }
+    }
+
+    runMatches(List(cpusMatcher, memMatcher), offer.resources.toList, Nil).right map {
+      case (remaining, matched) =>
+        (offer.copy(resources = remaining), matched)
+    }
+  }
+
+  @tailrec final def doMatch(instances: List[Instance], offer: Offer, state: MarathonState, effects: List[Effect]): List[Effect] = {
+    instances match {
+      case Nil =>
+        effects
+      case i :: restInstances =>
+        matchOffers(offer, state.rootGroup.get(i.runSpec).get) match {
+          case Left(reject) =>
+            println(reject)
+            doMatch(restInstances, offer, state, effects)
+          case Right((remainingOffer, resources)) =>
+            // let's match lol
+        ???
     }
   }
 

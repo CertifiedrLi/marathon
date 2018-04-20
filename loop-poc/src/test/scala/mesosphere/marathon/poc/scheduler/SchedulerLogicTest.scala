@@ -7,7 +7,7 @@ import java.util.UUID
 import mesosphere.marathon.poc.repository.StateTransition
 import mesosphere.marathon.poc.state.{ Instance, RunSpec, RunSpecRef }
 import mesosphere.marathon.test.SettableClock
-import org.apache.mesos.v1.mesos.{ AgentID, TaskID, TaskState, TaskStatus }
+import org.apache.mesos.v1.mesos.{ AgentID, FrameworkID, Offer, OfferID, Resource, TaskID, TaskState, TaskStatus, Value }
 import org.scalatest.Inside
 import mesosphere.marathon.poc.repository.StateAuthority
 
@@ -69,6 +69,55 @@ class SchedulerLogicTest extends AkkaUnitTestLike with Inside {
 
     inside(result.pull().futureValue) {
       case Some(SchedulerLogic.Effect.TaskUpdate(taskId, None)) =>
+    }
+  }
+
+  "it accepts offers for tasks that are targetted to be running" in {
+    val (input, result) = Source.queue[SchedulerLogicInputEvent](16, OverflowStrategy.fail)
+      .via(SchedulerLogic.eventProcesorFlow())
+      .toMat(Sink.queue())(Keep.both)
+      .run
+
+    input.offer(SchedulerLogicInputEvent.MarathonStateUpdate(
+      Seq(
+        StateTransition.RunSpecUpdated(
+          sampleRunSpec.ref,
+          Some(sampleRunSpec)),
+        StateTransition.InstanceUpdated(
+          sampleInstance.instanceId,
+          Some(sampleInstance)))))
+
+    result.pull().futureValue shouldBe Some(SchedulerLogic.Effect.WantOffers(instanceId))
+
+    val offer = Offer.apply(
+      OfferID("1"),
+      frameworkId = FrameworkID("1"),
+      agentId = AgentID("1"),
+      hostname = "1",
+      resources = Seq(
+        Resource(name = "cpus", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(16.0)), role = Some("*")),
+        Resource(name = "mem", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(256.0)), role = Some("*")),
+        Resource(name = "disk", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(1024.0)), role = Some("*"))))
+
+    input.offer(SchedulerLogicInputEvent.MesosOffer(offer))
+
+    val offerResponse = inside(result.pull().futureValue) {
+      case Some(r: SchedulerLogic.Effect.OfferResponse) =>
+        r.remainingOffer.id shouldBe offer.id
+        r
+    }
+
+    val launch = inside(offerResponse.operations.flatMap(_.launch)) {
+      case Seq(launch) =>
+        launch
+    }
+
+    inside(launch.taskInfos) {
+      case Seq(taskInfo) =>
+        taskInfo.command shouldBe Some(sampleRunSpec.command)
+        taskInfo.resources.toSet shouldBe Set(
+          Resource(name = "cpus", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(sampleRunSpec.cpus)), role = Some("*")),
+          Resource(name = "mem", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(sampleRunSpec.mem)), role = Some("*")))
     }
   }
 }

@@ -12,7 +12,9 @@ package state {
       id: String,
       variant: Variant,
       version: String,
-      command: String) {
+      command: String,
+      cpus: Double = 1.0,
+      mem: Double = 32.0) {
     def ref = RunSpecRef(id, variant)
   }
 
