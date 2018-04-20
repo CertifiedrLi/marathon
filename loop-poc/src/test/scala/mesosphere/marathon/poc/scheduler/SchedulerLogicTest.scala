@@ -21,30 +21,26 @@ class SchedulerLogicTest extends AkkaUnitTestLike with Inside {
     goal = Instance.Goal.Running)
 
   "signals that offers are wanted when a new instance is launched" in {
-    val (input, result) = Source.queue[SchedulerLogicInputEvent](16, OverflowStrategy.fail)
+    val inputEvents = List(
+      SchedulerLogicInputEvent.MarathonStateUpdate(
+        Seq(
+          StateTransition.RunSpecUpdated(
+            sampleRunSpec.ref,
+            Some(sampleRunSpec)),
+          StateTransition.InstanceUpdated(
+            sampleInstance.instanceId,
+            Some(sampleInstance)))))
+
+    val result = Source(inputEvents)
       .via(SchedulerLogic.eventProcesorFlow())
-      .toMat(Sink.queue())(Keep.both)
-      .run
+      .runWith(Sink.seq)
+      .futureValue
 
-    input.offer(SchedulerLogicInputEvent.MarathonStateUpdate(
-      Seq(
-        StateTransition.RunSpecUpdated(
-          sampleRunSpec.ref,
-          Some(sampleRunSpec)),
-        StateTransition.InstanceUpdated(
-          sampleInstance.instanceId,
-          Some(sampleInstance)))))
-
-    result.pull().futureValue shouldBe Some(SchedulerLogic.Effect.WantOffers(instanceId))
-    result
+    result.head shouldBe SchedulerLogic.Effect.WantOffers(instanceId)
   }
 
   "it kills unknown running tasks and expunges the task" in {
     val clock = new SettableClock
-    val (input, result) = Source.queue[SchedulerLogicInputEvent](16, OverflowStrategy.fail)
-      .via(SchedulerLogic.eventProcesorFlow(clock))
-      .toMat(Sink.queue())(Keep.both)
-      .run
 
     val mesosTaskId = MesosTaskId("lol", MesosTaskId.emptyUUID, 1L)
     val agentId = "lolol"
@@ -55,40 +51,31 @@ class SchedulerLogicTest extends AkkaUnitTestLike with Inside {
       agentId = Some(AgentID(agentId)))
     val Some(task) = MesosTask.apply(status)
 
-    input.offer(SchedulerLogicInputEvent.MesosTaskStatus(task))
+    val inputEvents = List(
+      SchedulerLogicInputEvent.MesosTaskStatus(task))
 
-    inside(result.pull().futureValue) {
-      case Some(SchedulerLogic.Effect.TaskUpdate(taskId, newState)) =>
+    val result = Source(inputEvents)
+      .via(SchedulerLogic.eventProcesorFlow(clock))
+      .runWith(Sink.seq)
+      .futureValue
+
+    inside(result(0)) {
+      case SchedulerLogic.Effect.TaskUpdate(taskId, newState) =>
         taskId shouldBe mesosTaskId
     }
-    inside(result.pull().futureValue) {
-      case Some(SchedulerLogic.Effect.KillTask(taskId, Some(agentId))) =>
+    inside(result(1)) {
+      case SchedulerLogic.Effect.KillTask(taskId, Some(agentId)) =>
         taskId shouldBe mesosTaskId
         agentId shouldBe agentId
     }
 
-    inside(result.pull().futureValue) {
-      case Some(SchedulerLogic.Effect.TaskUpdate(taskId, None)) =>
+    inside(result(2)) {
+      case SchedulerLogic.Effect.TaskUpdate(taskId, None) =>
     }
   }
 
   "it accepts offers for tasks that are targetted to be running" in {
-    val (input, result) = Source.queue[SchedulerLogicInputEvent](16, OverflowStrategy.fail)
-      .via(SchedulerLogic.eventProcesorFlow())
-      .toMat(Sink.queue())(Keep.both)
-      .run
-
-    input.offer(SchedulerLogicInputEvent.MarathonStateUpdate(
-      Seq(
-        StateTransition.RunSpecUpdated(
-          sampleRunSpec.ref,
-          Some(sampleRunSpec)),
-        StateTransition.InstanceUpdated(
-          sampleInstance.instanceId,
-          Some(sampleInstance)))))
-
-    result.pull().futureValue shouldBe Some(SchedulerLogic.Effect.WantOffers(instanceId))
-
+    val clock = new SettableClock
     val offer = Offer.apply(
       OfferID("1"),
       frameworkId = FrameworkID("1"),
@@ -99,10 +86,26 @@ class SchedulerLogicTest extends AkkaUnitTestLike with Inside {
         Resource(name = "mem", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(256.0)), role = Some("*")),
         Resource(name = "disk", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(1024.0)), role = Some("*"))))
 
-    input.offer(SchedulerLogicInputEvent.MesosOffer(offer))
+    val inputEvents = List(
+      SchedulerLogicInputEvent.MarathonStateUpdate(
+        Seq(
+          StateTransition.RunSpecUpdated(
+            sampleRunSpec.ref,
+            Some(sampleRunSpec)),
+          StateTransition.InstanceUpdated(
+            sampleInstance.instanceId,
+            Some(sampleInstance)))),
+      SchedulerLogicInputEvent.MesosOffer(offer))
 
-    val offerResponse = inside(result.pull().futureValue) {
-      case Some(r: SchedulerLogic.Effect.OfferResponse) =>
+    val results: Seq[SchedulerLogic.Effect] = Source(inputEvents)
+      .via(SchedulerLogic.eventProcesorFlow(clock))
+      .runWith(Sink.seq)
+      .futureValue
+
+    results(0) shouldBe SchedulerLogic.Effect.WantOffers(instanceId)
+
+    val offerResponse = inside(results(1)) {
+      case r: SchedulerLogic.Effect.OfferResponse =>
         r.remainingOffer.id shouldBe offer.id
         r
     }
@@ -114,10 +117,26 @@ class SchedulerLogicTest extends AkkaUnitTestLike with Inside {
 
     inside(launch.taskInfos) {
       case Seq(taskInfo) =>
-        taskInfo.command shouldBe Some(sampleRunSpec.command)
+        taskInfo.command.flatMap(_.value) shouldBe Some(sampleRunSpec.command)
         taskInfo.resources.toSet shouldBe Set(
           Resource(name = "cpus", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(sampleRunSpec.cpus)), role = Some("*")),
           Resource(name = "mem", `type` = Value.Type.SCALAR, scalar = Some(Value.Scalar(sampleRunSpec.mem)), role = Some("*")))
     }
+
+    val taskUpdate = inside(results(2)) {
+      case t: SchedulerLogic.Effect.TaskUpdate =>
+        t
+    }
+
+    taskUpdate.taskId shouldBe sampleInstance.mesosTaskId
+    inside(taskUpdate.newState) {
+      case Some(mesosTask) =>
+        inside(mesosTask.phase) {
+          case MesosTask.Phase.Launching(timestamp) =>
+            timestamp shouldBe clock.instant()
+        }
+    }
+
+    results(3) shouldBe SchedulerLogic.Effect.NoWantOffers(sampleInstance.instanceId)
   }
 }

@@ -8,9 +8,8 @@ import java.util.UUID
 import mesosphere.marathon.poc.repository.{ StateFrame, StateTransition }
 import mesosphere.marathon.poc.repository.MarathonState
 import mesosphere.marathon.poc.state.{ Instance, RunSpec }
-import org.apache.mesos.v1.mesos.{ Offer, OfferID, Resource, TaskState, TaskStatus, Value }
+import org.apache.mesos.v1.mesos
 import monocle.macros.syntax.lens._
-import monocle.function.At.at
 import scala.annotation.tailrec
 
 case class MesosTaskId(
@@ -56,7 +55,7 @@ object MesosTask {
     case _: Phase.Killing | _: Phase.Terminal => true
   }
 
-  def apply(mesosTask: TaskStatus): Option[MesosTask] =
+  def apply(mesosTask: mesos.TaskStatus): Option[MesosTask] =
     mesosTask.agentId.value map { agentId =>
       MesosTask(
         MesosTaskId(mesosTask.taskId.value),
@@ -69,8 +68,8 @@ object MesosTask {
     */
   sealed trait Phase
   object Phase {
-    def apply(taskStatus: TaskStatus): Phase = {
-      import TaskState._
+    def apply(taskStatus: mesos.TaskStatus): Phase = {
+      import mesos.TaskState._
       val timestamp = Instant.ofEpochMilli((taskStatus.timestamp.getOrElse(0.0) * 1000).toLong)
 
       taskStatus.state match {
@@ -81,6 +80,9 @@ object MesosTask {
           Killing(timestamp, taskStatus)
         case TASK_FINISHED | TASK_FAILED | TASK_KILLED | TASK_ERROR | TASK_DROPPED | TASK_GONE | TASK_GONE_BY_OPERATOR =>
           Terminal(timestamp, taskStatus)
+        case Unrecognized(_) =>
+          // ¯\_(ツ)_/¯
+          ???
       }
     }
 
@@ -89,16 +91,16 @@ object MesosTask {
       * We have received a MesosStatus for this task.
       */
     case class Running(
-        status: TaskStatus) extends Phase
+        status: mesos.TaskStatus) extends Phase
 
     /** We're killing this task */
     case class Killing(
         lastkilledAt: Instant,
-        status: TaskStatus) extends Phase
+        status: mesos.TaskStatus) extends Phase
 
     case class Terminal(
         timestamp: Instant,
-        status: TaskStatus) extends Phase
+        status: mesos.TaskStatus) extends Phase
   }
 }
 
@@ -117,7 +119,7 @@ object MesosState {
 sealed trait SchedulerLogicInputEvent
 object SchedulerLogicInputEvent {
   case class MarathonStateUpdate(updates: Seq[StateTransition]) extends SchedulerLogicInputEvent
-  case class MesosOffer(offer: Offer) extends SchedulerLogicInputEvent
+  case class MesosOffer(offer: mesos.Offer) extends SchedulerLogicInputEvent
   case class MesosTaskStatus(task: MesosTask) extends SchedulerLogicInputEvent
   case class QueryFrame(requestId: UUID) extends SchedulerLogicInputEvent
 }
@@ -134,12 +136,14 @@ object SchedulerLogic {
   sealed trait Effect
   sealed trait MesosEffect extends Effect
   object Effect {
+    sealed trait OfferSignal extends MesosEffect
     /**
       * Indicate that an instance wants offers (so it can launch)
       *
       * for multi-role could include the role here so downstream Mesos can update subscription accordingly
       */
-    case class WantOffers(instanceId: UUID) extends MesosEffect
+    case class WantOffers(instanceId: UUID) extends OfferSignal
+    case class NoWantOffers(instanceId: UUID) extends OfferSignal
 
     /**
       * Indicate to Mesos that a task should be killed
@@ -156,9 +160,9 @@ object SchedulerLogic {
     case class EmitState(requestId: UUID, frame: SchedulerFrame) extends Effect
 
     case class OfferResponse(
-        offerId: OfferID,
-        remainingOffer: Offer,
-        operations: Seq[Offer.Operation]
+        offerId: mesos.OfferID,
+        remainingOffer: mesos.Offer,
+        operations: Seq[mesos.Offer.Operation]
     ) extends MesosEffect
   }
 
@@ -255,41 +259,42 @@ object SchedulerLogic {
     * Return:
     *   Right((remainingOffer, matchedResources)) | Left(rejectReason)
     */
-  def matchOffers(offer: Offer, runSpec: RunSpec): Either[RejectReason, (Offer, Seq[Resource])] = {
-    def consumeScalar(resource: Resource, amount: Double): (Resource, Resource) = {
+  def matchOffers(offer: mesos.Offer, runSpec: RunSpec): Either[RejectReason, (mesos.Offer, Seq[mesos.Resource])] = {
+    def consumeScalar(resource: mesos.Resource, amount: Double): (mesos.Resource, mesos.Resource) = {
       val remaining = resource.lens(_.scalar).modify {
-        case Some(scalar) => Some(Value.Scalar(scalar.value - amount))
+        case Some(scalar) => Some(mesos.Value.Scalar(scalar.value - amount))
         case None => None // shouldn't get here
       }
       val consumed = resource.lens(_.scalar).modify {
-        case Some(scalar) => Some(Value.Scalar(amount))
+        case Some(scalar) => Some(mesos.Value.Scalar(amount))
         case None => None // shouldn't get here
       }
 
       (remaining, consumed)
     }
 
-    type Matcher = PartialFunction[Resource, (Resource, Resource)]
+    case class ResourceMatcher(description: String, fn: PartialFunction[mesos.Resource, (mesos.Resource, mesos.Resource)]) {
+    }
 
-    val cpusMatcher: Matcher = {
+    val cpusMatcher = ResourceMatcher(s"cpus ${runSpec.cpus}", {
       case cpus if cpus.name == "cpus" && cpus.scalar.forall(_.value >= runSpec.cpus) =>
         consumeScalar(cpus, runSpec.cpus)
-    }
-    val memMatcher: Matcher = {
-      case mem if mem.name == "cpus" && mem.scalar.forall(_.value >= runSpec.mem) =>
+    })
+    val memMatcher = ResourceMatcher(s"mem ${runSpec.mem}", {
+      case mem if mem.name == "mem" && mem.scalar.forall(_.value >= runSpec.mem) =>
         consumeScalar(mem, runSpec.mem)
-    }
+    })
 
-    @tailrec def runMatches(matchers: List[Matcher], resources: List[Resource], matched: List[Resource]): Either[RejectReason, (List[Resource], List[Resource])] = {
+    @tailrec def runMatches(matchers: List[ResourceMatcher], resources: List[mesos.Resource], matched: List[mesos.Resource]): Either[RejectReason, (List[mesos.Resource], List[mesos.Resource])] = {
       matchers match {
         case Nil =>
           Right((resources, matched))
         case m :: restMatchers =>
-          val matchIndex = resources.indexWhere { r => m.isDefinedAt(r) }
+          val matchIndex = resources.indexWhere { r => m.fn.isDefinedAt(r) }
           if (matchIndex == -1)
-            Left(RejectReason("Not all resources were satisfied"))
+            Left(RejectReason(s"Not all resources were satisfied: ${m.description}"))
           else {
-            val (remaining, thisMatch) = m(resources(matchIndex))
+            val (remaining, thisMatch) = m.fn(resources(matchIndex))
             runMatches(
               restMatchers,
               resources.updated(matchIndex, remaining),
@@ -304,18 +309,21 @@ object SchedulerLogic {
     }
   }
 
-  @tailrec final def doMatch(instances: List[Instance], offer: Offer, state: MarathonState, effects: List[Effect]): List[Effect] = {
+  case class OfferMatch(resources: Seq[mesos.Resource], instance: Instance, runSpec: RunSpec)
+  @tailrec final def doMatch(instances: List[Instance], offer: mesos.Offer, state: MarathonState, matches: List[OfferMatch]): (mesos.Offer, List[OfferMatch]) = {
     instances match {
       case Nil =>
-        effects
+        (offer, matches)
       case i :: restInstances =>
-        matchOffers(offer, state.rootGroup.get(i.runSpec).get) match {
+        val runSpec = state.rootGroup.get(i.runSpec).get
+        matchOffers(offer, runSpec) match {
           case Left(reject) =>
             println(reject)
-            doMatch(restInstances, offer, state, effects)
+            doMatch(restInstances, offer, state, matches)
           case Right((remainingOffer, resources)) =>
             // let's match lol
-        ???
+            doMatch(restInstances, remainingOffer, state, OfferMatch(resources, i, runSpec) :: matches)
+        }
     }
   }
 
@@ -345,8 +353,49 @@ object SchedulerLogic {
             taskUpdates ++ effects
 
           case SchedulerLogicInputEvent.MesosOffer(offer) =>
+            // if any instances are removed, we need to remove them from wantingOffers also.
+            wantingOffers.retain(frame.state.instances.instances.contains(_))
+
             // match offers for pending tasks
-            ???
+            doMatch(
+              wantingOffers.flatMap(frame.state.instances.instances.get)(collection.breakOut),
+              offer,
+              frame.state,
+              Nil) match {
+              case (_, Nil) =>
+                Seq(Effect.OfferResponse(offer.id, offer, Nil))
+              case (remaining, matches) =>
+                val taskInfos = matches.map {
+                  case OfferMatch(resources, instance, runSpec) =>
+                    mesos.TaskInfo(
+                      name = instance.mesosTaskId.asString,
+                      taskId = mesos.TaskID(instance.mesosTaskId.asString),
+                      agentId = offer.agentId,
+                      resources= resources,
+                      command = Some(mesos.CommandInfo(value = Some(runSpec.command), shell = Some(true))))
+                }
+
+                val launchOperation = Effect.OfferResponse(
+                  offer.id,
+                  remaining,
+                  Seq(
+                    mesos.Offer.Operation(
+                      launch = Some(mesos.Offer.Operation.Launch(taskInfos)))))
+
+                val noWantOffers = matches.map { m => Effect.NoWantOffers(m.instance.instanceId) }
+                val taskUpdates = matches.map { m =>
+                  Effect.TaskUpdate(m.instance.mesosTaskId,
+                    Some(
+                      MesosTask(
+                        taskId = m.instance.mesosTaskId,
+                        agentId = offer.agentId.value,
+                        phase = MesosTask.Phase.Launching(clock.instant())))),
+                }
+
+                frame = frame.copy(mesosState = applyTaskUpdates(frame.mesosState, taskUpdates))
+
+                launchOperation :: (taskUpdates ++ noWantOffers)
+            }
 
           case SchedulerLogicInputEvent.QueryFrame(requestId) =>
             Seq(Effect.EmitState(requestId, frame))
@@ -362,6 +411,8 @@ object SchedulerLogic {
 
         // update wantingOffers
         effects.foreach {
+          case e: Effect.NoWantOffers =>
+            wantingOffers -= e.instanceId
           case e: Effect.WantOffers =>
             wantingOffers += e.instanceId
           /* case e: Effect.LaunchTask(instanceId, _) => wantingOffers -= instanceId */
