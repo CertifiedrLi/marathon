@@ -15,13 +15,24 @@ import scala.concurrent.duration._
 object MesosAdapter extends StrictLogging {
   // Could also manage subscriptions
   def offerReviver(calls: MesosCalls, reviveRate: FiniteDuration = 5.seconds) = Flow[SchedulerLogic.MesosEffect].
-    collect { case e: SchedulerLogic.Effect.WantOffers => e }.
-    groupedWithin(Int.MaxValue, reviveRate)
-    .mapConcat { offersWanted =>
-      if (offersWanted.isEmpty)
-        Nil
-      else
-        Seq(calls.newRevive(None))
+    collect { case e: SchedulerLogic.Effect.OfferSignal => e }.
+    groupedWithin(Int.MaxValue, reviveRate).
+    statefulMapConcat { () =>
+      val instances = collection.mutable.Set.empty[UUID]
+
+      { signals =>
+        signals.foreach {
+          case SchedulerLogic.Effect.WantOffers(uuid) =>
+            instances += uuid
+          case SchedulerLogic.Effect.NoWantOffers(uuid) =>
+            instances -= uuid
+        }
+
+        if (instances.nonEmpty)
+          Seq(calls.newRevive(None))
+        else
+          Nil
+      }
     }
 
   def eventResponder(calls: MesosCalls) = Flow[SchedulerLogic.MesosEffect].mapConcat {
